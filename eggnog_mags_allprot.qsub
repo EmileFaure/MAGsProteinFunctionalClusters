@@ -1,0 +1,11 @@
+#!/bin/bash
+#$ -V
+#$ -cwd
+#$ -q long.q
+#$ -pe thread 20
+#$ -o eggnog.out
+#$ -e eggnog.err
+
+source $CONDA3/activate eggnog-mapper-1.0.3
+emapper.py -i /projet/externe/upmc/efaure/MAGs_Project/input/Seq_allprot/Seq_allprotinCC.fa --output /scratch/externe/upmc/efaure/Seq_allprotinCC.fa -m diamond --no_annot --no_file_comments --cpu 20
+source deactivate

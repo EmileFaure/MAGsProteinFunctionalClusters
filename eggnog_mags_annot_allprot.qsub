@@ -1,0 +1,11 @@
+#!/bin/bash
+#$ -V
+#$ -cwd
+#$ -q short.q
+#$ -pe thread 20
+#$ -o test_annot.out
+#$ -e test_annot.err
+
+source $CONDA3/activate eggnog-mapper-1.0.3
+emapper.py --annotate_hits_table /projet/externe/upmc/efaure/MAGs_Project/input/test_annotation_speed.emapper.seed_orthologs -o /scratch/externe/upmc/efaure/test_annot_speed.fa --no_file_comments --cpu 20
+
