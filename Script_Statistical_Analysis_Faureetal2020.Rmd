@@ -6,7 +6,7 @@ output:
     df_print: paged
 ---
 Emile Faure
-Last modification : 15/10/2020
+Last modification : 03/03/2021
 Please note that what we describe as Protein Functional Clusters in our article's main text is here called CC, for connected components.
 
 ```{r}
