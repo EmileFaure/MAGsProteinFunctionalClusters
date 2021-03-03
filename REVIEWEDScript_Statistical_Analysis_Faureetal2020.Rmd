@@ -1,0 +1,2072 @@
+---
+title: Towards quantitative predictions of planktonic functional diversity
+  from physico-chemical data
+output:
+  html_document:
+    df_print: paged
+---
+Emile Faure
+Last modification : 15/10/2020
+Please note that what we describe as Protein Functional Clusters in our article's main text is here called CC, for connected components.
+
+```{r}
+
+# PACKAGES IMPORTATION
+library(igraph)
+library(ggplot2)
+theme_set(theme_minimal()) 
+library(vegan)
+library(gridExtra)
+library(caret)
+library(glmnet)
+library(reshape2)
+library(TeachingDemos)
+library(plm)
+library(car)
+library(ggrepel)
+library(randomForest)
+library(plyr)
+library(dplyr)
+library(doParallel)
+library(foreach)
+library(maps)
+
+```
+
+We already have genes quantifications, genes annotations, and sets of nodes and edges based on genes similarities and coverage. We first need to build the sequence similarity network, and derive abundance tables from it.
+
+```{r}
+############### BUILDING AN ABUNDANCE TABLE #################
+#  Emile Faure, 2019
+
+###### Data Importation ######
+quant_genes = read.table("/media/DATA/Emile/TARA_Genomics/Salmon_Quant_Output/quantif_genes", header = T)
+v_80 = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Proka_MAGs_Diamond_out_1e-3_no-selfhits_pident80_cov80.blastp.vertices", h=T, sep=";", quote=NULL)
+e_80 = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Proka_MAGs_Diamond_out_1e-3_no-selfhits_pident80_cov80.blastp.edges", h=T, sep=";")
+
+# Let's reduce the quant_genes file to the 757,457 genes found in the SSN
+length(which(quant_genes$Name %in% v_80$name)) # 757,457
+
+quant_genes = quant_genes[which(quant_genes$Name %in% v_80$name),]
+
+# Now we need to sum abundances of the 163 metagenomes to match the 93 samples
+samples = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/Sample_ERRID_NbSeqPairs.csv", header = T, sep = ";")
+summary(samples)
+
+abund_genes = as.data.frame(quant_genes$Name)
+names(abund_genes) = "Sample_ID"
+for (i in c(1:nrow(samples))) {
+  abund_genes[,i+1] = rep(0,nrow(abund_genes)) # Initialize column
+  errid = which(names(quant_genes) %in% unlist(samples[i,2:5])) # get column numbers in quant_genes corresponding to focal sample
+  for (j in c(1:length(errid))) {
+   abund_genes[,i+1] = abund_genes[,i+1] + quant_genes[,errid[j]]   # add each column
+  }
+  names(abund_genes)[i+1] = as.character(samples[i,1]) # Rename column
+  abund_genes[,i+1] = abund_genes[,i+1]/samples[i,6]*1000000000 # Normalize by Nb QC seqpairs
+}
+
+row.names(abund_genes) = abund_genes[,1]
+abund_genes = abund_genes[,-1]
+
+# We note that the 49th sample, "MED_23_05M" has an outlier value
+# It's corresponding to ERR are ERR315858 & ERR315861
+# The gene is TARA_MED_MAG_00097_000000000001_1, it is not outlying because of a mistake, 
+# as it is very much present in the salmon data already (196248 reads mapped to it)
+# Moreover, it is similarly expressed in the 2 duplicates ERR315858 & ERR315861
+# The sequence is quite long, and appears in only one PFC
+
+#write.table(abund_genes, "/home/faure/Documents/PhD/MAGs_Project/TabAbund_Genes_Mags")
+#read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/TabAbund_Genes_Mags")
+
+######## Abundance table for CCs
+
+g_80 = graph.data.frame(e_80, directed=F, vertices=v_80)
+#rm(quant_genes,e_80,samples)
+
+# We conserve all CCs, using min vertices = 2
+comp = decompose.graph(g_80, min.vertices = 2)
+
+vertex_in_cc = c()
+corres_cc = c()
+j=1
+for (i in comp) {
+  vertex=V(i)$name
+  vertex_in_cc = c(vertex_in_cc,vertex)
+  corres_cc = c(corres_cc,rep(j,length(vertex)))
+  j=j+1
+}
+
+length(vertex_in_cc)
+length(corres_cc)
+
+corres_cc = paste(rep("CC_",length(corres_cc)),corres_cc, sep = "")
+
+abund_cc = data.frame(CC_ID = corres_cc, Genes = vertex_in_cc)
+
+abund_cc = merge(x=abund_cc,y=abund_genes,by.x = "Genes",by.y="row.names")
+row.names(abund_cc)=abund_cc$Genes
+abund_cc = abund_cc[,-1]
+head(abund_cc)
+
+#write.table(abund_cc, "/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_NOsum_CC2")
+#abund_cc = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_NOsum_CC2")
+
+# Now a version with mean abundance by CC
+abund_cc_mean = aggregate(abund_cc[,-1], list(abund_cc$CC_ID), mean)
+row.names(abund_cc_mean)=abund_cc_mean$Group.1
+abund_cc_mean = abund_cc_mean[,-1]
+
+#write.table(abund_cc_mean, "/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_mean_CC2")
+
+#Empty environment before next section
+rm(list=ls())
+```
+
+Now we can explore the size, the functional and taxonomical homogeneity of the connected components.
+
+```{r}
+############### Investigating protein functional clusters composition #################
+#  Emile Faure, 2019
+
+###### Data Importation ######
+abund_cc = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_NOsum_CC2", header = T)
+abund_cc$protID = row.names(abund_cc)
+abund_cc = abund_cc[,c(1,95)]
+
+# Here we will only need the cc id column
+annots_egg = read.table("/media/DATA/Emile/TARA_Genomics/Annotations/Allprot_eggNOG_Functional_description", header = F, sep="\t", quote="",  na.strings = "")
+names(annots_egg)=c("protID", "Annot")
+KOprot = read.table("/media/DATA/Emile/TARA_Genomics/Annotations_KOFamScan/KOFamScan_AllProt", header = F, na.strings = "", sep = "\t")
+names(KOprot) = c("protID","Annot")
+# Multiple Kegg IDs can be associated to one protein, we need them on one line.
+agg_kegg = function(x) {
+  keggs = as.character(x$Annot)
+  keggs = unique(keggs)
+  keggs = keggs[!is.na(keggs)]
+  return(paste(keggs, collapse=" "))
+}
+
+Kegg_oneline = KOprot %>%
+  group_by(protID) %>%
+  do(data.frame(Annot_oneline=agg_kegg(.)))
+Kegg_oneline = as.data.frame(Kegg_oneline)
+Kegg_oneline$Annot_oneline = replace(Kegg_oneline$Annot_oneline, Kegg_oneline$Annot_oneline == "", NA)
+
+cc_annot = merge(x=abund_cc,y=annots_egg,by="protID", all.x = T)
+cc_kegg = merge(x=abund_cc,y=Kegg_oneline, by="protID", all.x = T)
+cc_annot = cc_annot[,c(2,3)]
+cc_kegg = cc_kegg[,c(2,3)]
+names(cc_kegg)[2] = "Annot"
+
+##### SIZE #####
+cc_size = cc_annot %>%
+  group_by(CC_ID) %>%
+  do(data.frame(size = nrow(.)))
+summary(cc_size)
+
+#### Functional indices ####
+func_homscore = function(x) {
+  annot = as.character(x$Annot)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_kegg = cc_kegg %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.kegg =func_homscore(.)))
+homscore_kegg = as.data.frame(homscore_kegg)
+
+homscore_eggnog = cc_annot %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.eggnog=func_homscore(.)))
+homscore_eggnog = as.data.frame(homscore_eggnog)
+
+#summary(homscore_kegg)
+#summary(homscore_eggnog)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Annot)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_eggnog = cc_annot %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.eggnog=func_unkscore(.)))
+unkscore_eggnog = as.data.frame(unkscore_eggnog)
+
+unkscore_kegg = cc_kegg %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.kegg=func_unkscore(.)))
+unkscore_kegg = as.data.frame(unkscore_kegg)
+
+#summary(unkscore_eggnog)
+#summary(unkscore_kegg)
+
+#### Taxonomical indices ####
+mags_taxo = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/Mags_Taxo.csv", header = T, sep = ",", na.strings = c("na"))
+
+abund_cc$MAGID = substr(abund_cc$protID, 1,18)
+cc_taxo = merge(abund_cc, mags_taxo, by.x = "MAGID", by.y = "MAG")
+
+##### Domain level #####
+func_homscore = function(x) {
+  annot = as.character(x$Domain)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Domain = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Domain =func_homscore(.)))
+homscore_taxo_Domain = as.data.frame(homscore_taxo_Domain)
+
+##### Phylum level #####
+func_homscore = function(x) {
+  annot = as.character(x$Phylum)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Phylum = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Phylum =func_homscore(.)))
+homscore_taxo_Phylum = as.data.frame(homscore_taxo_Phylum)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Phylum)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_Phylum = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.Phylum=func_unkscore(.)))
+unkscore_taxo_Phylum = as.data.frame(unkscore_taxo_Phylum)
+
+##### Class level #####
+func_homscore = function(x) {
+  annot = as.character(x$Class)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Class = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Class=func_homscore(.)))
+homscore_taxo_Class = as.data.frame(homscore_taxo_Class)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Class)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_Class = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.Class=func_unkscore(.)))
+unkscore_taxo_Class = as.data.frame(unkscore_taxo_Class)
+
+##### Order level #####
+func_homscore = function(x) {
+  annot = as.character(x$Order)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Order = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Order =func_homscore(.)))
+homscore_taxo_Order = as.data.frame(homscore_taxo_Order)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Order)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_Order = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.Order=func_unkscore(.)))
+unkscore_taxo_Order = as.data.frame(unkscore_taxo_Order)
+
+##### family level #####
+func_homscore = function(x) {
+  annot = as.character(x$Family)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Family = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Family =func_homscore(.)))
+homscore_taxo_Family = as.data.frame(homscore_taxo_Family)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Family)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_Family = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.Family=func_unkscore(.)))
+unkscore_taxo_Family = as.data.frame(unkscore_taxo_Family)
+
+##### Genus level #####
+func_homscore = function(x) {
+  annot = as.character(x$Genus)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_Genus = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.Genus =func_homscore(.)))
+homscore_taxo_Genus = as.data.frame(homscore_taxo_Genus)
+
+func_unkscore = function(x) {
+  annot = as.character(x$Genus)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_Genus = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.Genus=func_unkscore(.)))
+unkscore_taxo_Genus = as.data.frame(unkscore_taxo_Genus)
+
+##### MAG level #####
+func_homscore = function(x) {
+  annot = as.character(x$MAGID)
+  nprot = nrow(x)
+  annot = unique(annot)
+  annot = annot[!is.na(annot)]
+  if(length(annot) == 0) {
+    homscore = NA
+  } else if (length(annot) == 1) {
+    homscore = 1
+  } else {
+    homscore = 1 - length(annot)/nprot    
+  }
+  return(homscore)
+}
+
+homscore_taxo_MAG = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Homogeneity.taxo.MAG =func_homscore(.)))
+homscore_taxo_MAG = as.data.frame(homscore_taxo_MAG)
+
+func_unkscore = function(x) {
+annot = as.character(x$MAGID)
+  nprot = nrow(x)
+  annot = annot[!is.na(annot)]
+  unkscore = (nprot-length(annot))/nprot
+  return(unkscore)
+}
+
+unkscore_taxo_MAG = cc_taxo %>%
+  group_by(CC_ID) %>%
+  do(data.frame(Unknowns.taxo.MAG=func_unkscore(.)))
+unkscore_taxo_MAG = as.data.frame(unkscore_taxo_MAG)
+#####
+
+# Regroup all levels
+cc_stats = Reduce(function(x,y) merge(x,y),list(cc_size, homscore_kegg, homscore_eggnog, homscore_taxo_Phylum, 
+                                                homscore_taxo_Class, homscore_taxo_Order, homscore_taxo_Family,
+                                                homscore_taxo_Genus, homscore_taxo_MAG, unkscore_eggnog, unkscore_kegg, 
+                                                unkscore_taxo_Phylum, unkscore_taxo_Class, unkscore_taxo_Order,
+                                                unkscore_taxo_Family, unkscore_taxo_Genus, unkscore_taxo_MAG))
+
+#write.table(cc_stats, "/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/CC_stats_with_taxo")
+
+#Empty environment before next section
+rm(list=ls())
+```
+
+Then, we can link the PFCs to the environment.
+
+```{r}
+############### Linking the CC DISTRIBUTION with the ENVIRONMENT #################
+#  Emile Faure, 2020
+
+######                           Data Importation                                        ######
+
+# For graphic purposes
+source("http://peterhaschke.com/Code/multiplot.R")
+
+# Abundance
+abund_cc = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_mean_CC2", header = T)
+abund_cc = as.data.frame(t(abund_cc))
+
+# Environment
+envi_cc=read.table("/home/faure/Documents/PhD/Data_Pangeae/Envi_context_Faure_et_al_2020.txt", sep = "\t", header=T)
+# This table is missing the size fraction info (all stations up to number 52 are 0.22-1.6, then it switches to 0.22-3)
+envi_cc$upper_size_fraction = 3
+envi_cc[which(as.numeric(substr(rownames(envi_cc),6,8))<53),]$upper_size_fraction = 1.6
+envi_cc$upper_size_fraction = as.factor(envi_cc$upper_size_fraction)
+
+# Annotations
+cc_annot=read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/CC_annot_8080", header=T)
+cc_annot$CC_ID = paste("CC", cc_annot$CC_ID, sep="_")
+cc_COGCat=read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/CC_COGCat_8080", header=T)
+cc_COGCat$CC_ID =  paste("CC", cc_COGCat$CC_ID, sep="_")
+CC2Kegg = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/AnnotKOFAM/CC2Kegg_8080", header = T) # cf KeggAnnotCC.R
+KeggToPathway = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/AnnotKOFAM/KO_pathways_mapping_file", header = F, sep = "\t", na.strings="")
+names(KeggToPathway) = c("Kegg_ID", "Pathway_ID", "Pathway_Description")
+
+# CC_stats
+cc_stats = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/CC_stats_with_taxo")
+
+# Taxonomy of MAGs
+mags_taxo = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/Mags_Taxo.csv", header = T, sep = ",", na.strings = c("na"))
+
+# Correspondance CC-MAGs
+CC_2_Mag = read.table("/home/faure/Documents/PhD/MAGs_Project/Data_tables/S80_C80/Tables_CC_2/TabAbund_CC_NOsum_CC2", header = T)
+
+######                            Table matching                                        #######
+
+# First, let's replace the co-assembly ID by "TARA"
+list.coass = list("ANE","ANW","ASW","ASE","ION","IOS","PON","PSE","PSW","RED","MED","SOC")
+string.coass = paste(unlist(list.coass), collapse = "|")
+row.names(abund_cc) = gsub(string.coass, replacement = "TARA", x = row.names(abund_cc))
+# Then let's add a 0 to numbers that aren't 3 long
+for (i in c(1:nrow(abund_cc))) {
+  if (nchar(row.names(abund_cc)[i])<12) {
+    row.names(abund_cc)[i] = paste(unlist(strsplit(row.names(abund_cc)[i], split = "_"))[1], "_0", unlist(strsplit(row.names(abund_cc)[i], split = "_"))[2],
+                                   "_", unlist(strsplit(row.names(abund_cc)[i], split = "_"))[3], sep = "")
+  }
+}
+row.names(abund_cc) = gsub("72_100M","072_100M", row.names(abund_cc))
+# Finally, let's change meters to SRF and DCM
+row.names(abund_cc) = gsub("05M","SRF",row.names(abund_cc))
+string.dcm = c("30M|35M|40M|25M|75M|45M|100M|60M|90M|66M|80M|50M|65M|70M|17M")
+row.names(abund_cc) = gsub(string.dcm, "DCM", row.names(abund_cc))
+
+# Now we need to order abundcc rows like the ones of envi_cc
+abund_cc = abund_cc[order(row.names(abund_cc)),]
+
+######                            Data pre-processing                                        #######
+
+# We can now center, scale, inpute NAs, get rid of highly correlated variables, and near zero variance predictors
+envi_cc_mltrans = preProcess(envi_cc, method = c("center","scale","knnImpute","corr","nzv"))
+
+envi_cc_ml = predict(envi_cc_mltrans, envi_cc)
+# Down to 52 variables !
+
+# Some CCs have constant null abundances and should be removed for further statistical analysis, all are unknown proteins
+#names(abund_cc[, sapply(abund_cc, function(v) var(v, na.rm=TRUE)==0)])
+#abund_cc[,grep("CC_115015", names(abund_cc))]
+#cc_annot[grep("CC_115015", cc_annot$CC_ID),]
+#abund_cc[,grep("CC_154820", names(abund_cc))]
+#cc_annot[grep("CC_154820", cc_annot$CC_ID),]
+#abund_cc[,grep("CC_163862", names(abund_cc))]
+#cc_annot[grep("CC_163862", cc_annot$CC_ID),]
+#abund_cc[,grep("CC_187508", names(abund_cc))]
+#cc_annot[grep("CC_187508", cc_annot$CC_ID),]
+#abund_cc[,grep("CC_38191", names(abund_cc))]
+#cc_annot[grep("CC_38191", cc_annot$CC_ID),]
+
+abund_cc = abund_cc[,apply(abund_cc, 2, var, na.rm=TRUE) != 0]
+
+# We still have many CCs with very small variance, that can be problematic when building training sets (if variance = 0 on the training set the model can't work)
+abund_cc_nzv = preProcess(abund_cc, method = c("nzv"))
+abund_cc_var = data.frame(predict(abund_cc_nzv,abund_cc))
+
+######                            First exploration : unsupervised learning             #######
+
+acp = rda(abund_cc)
+summary(acp)
+#33% of variance on 2 axes.
+plot(acp)
+
+afc = cca(abund_cc)
+summary(afc)
+#17.8% of variance on 2 axes
+plot(afc)
+
+######                            Random forest regressions   #######
+
+#setup parallel backend to use many processors
+cores=detectCores()
+cl <- makeCluster(cores[1]-2) #not to overload your computer
+registerDoParallel(cl)
+
+# Launch the models, note that this is quite a long process, you can skip it by charging directly the output using the last line of this section
+rf.cc <- foreach(j=1:228914, .combine=rbind) %dopar% {
+  library(caret)
+  library(randomForest)
+  
+  # We create 10 data partitions
+  set.seed(1994)
+  TrainIndex = createDataPartition(y = abund_cc_var[,j], p = .75, list = F, times = 10)
+  
+  # Create a dataset for the focal CC
+  data = cbind(abund_cc_var[,j], envi_cc_ml)
+  names(data)[1] = colnames(abund_cc_var)[j]
+  
+  control = trainControl(method='cv', 
+                       number = 5, 
+                       verboseIter = F)
+  t.grid = expand.grid(
+    mtry = 5:9 # The square root of variables number is 7, we explore around it 
+  )
+ 
+  # Vector for mse decrease :
+  rf.oobR2 = c(0)
+  rf.oobRsquared = c(0)
+  rf.predR2 = c(0)
+  rf.predRsquared = c(0)
+  imp.env = matrix(nrow = 10, ncol = 52)
+  
+  for (i in c(1:10)) {
+    train.data  <- data[TrainIndex[,i],]
+    test.data <- data[-TrainIndex[,i], ]
+    
+    set.seed(1994)
+    model <- train(
+    train.data[,-1],
+    train.data[,1], 
+    method = "rf",
+    trControl = control,
+    tuneGrid = t.grid,
+    num.trees = 500,
+    importance = T
+    )
+    
+    #Out of bag estimation of R2:
+    rf.oobR2[i] = model$results$Rsquared[which(model$results$RMSE==min(model$results$RMSE))] #Rsquared of best model using OOB samples
+    rf.oobRsquared[i] = model$finalModel$rsq[500] #Rsquared of best model using OOB samples calculated through RF default method
+    
+    #Importance of variables:
+    imp.env[i,] = model$finalModel$importance[,2] #Columns already in the same order as envi_cc_ml
+    
+    # Make predictions on the test data
+    predictions = predict(model, test.data[,-1])
+
+    # Model predictive performance metric
+    rf.predR2[i] = R2(predictions, test.data[,1])
+    rf.predRsquared[i] = 1 - sum((test.data[,1]-predictions)^2)/sum((test.data[,1]-mean(test.data[,1]))^2) # Beware, =-Inf when test data constant
+  }
+  rf.predRsquared[is.infinite(rf.predRsquared)] <- NA # Change Inf to NA
+  
+  newrow = c(names(abund_cc_var)[j], mean(rf.oobR2, na.rm = T), mean(rf.oobRsquared, na.rm = T), mean(rf.predR2, na.rm = T),
+             mean(rf.predRsquared, na.rm = T), colMeans(imp.env))
+  newrow
+}
+
+rf.cc = as.data.frame(rf.cc)
+
+names(rf.cc) = c("CC_ID","OOB_R2_COR", "OOB_R2_SUM", "PRED_R2_COR", "PRED_R2_SUM", names(envi_cc_ml))
+rownames(rf.cc) = rf.cc$CC_ID
+rf.cc = rf.cc[,-1]
+
+#lapply(rf.cc, class) # ALl factor but we want a numeric
+rf.cc[] = lapply(rf.cc, function(x) {
+  as.numeric(as.character(x))
+})
+rf.cc = as.data.frame(rf.cc)
+
+summary(rf.cc)
+
+# We can export the random forest results table
+write.table(rf.cc, '/home/faure/Documents/PhD/MAGs_Project/Data_tables/Post-Review/RF_Outputs_ALLvariablesCC_REVIEWED_BothR2')
+#rf.cc = read.table('/home/faure/Documents/PhD/MAGs_Project/Data_tables/Random_Forest_Outputs/RF_Outputs_ALLvariablesCC')
+
+##############   Graphical exploration of the results ######
+
+cor(rf.cc$OOB_R2_COR,rf.cc$PRED_R2_COR) #0.81
+
+# Rsquared
+ggplot() + 
+  geom_jitter(aes(x= '', y = rf.cc$OOB_R2_COR), alpha = 0.2, colour = 'darkgreen', width = 0.38) +
+  geom_boxplot(aes(x= '', y = rf.cc$OOB_R2_COR), fill="mediumseagreen", alpha = 0.7) +
+  labs(x = '', y = expression(R^{2} ~ "of random forest models based on OOB samples")) +
+  scale_y_continuous(breaks = c(0.0,0.25,0.5,0.75))
+
+ggplot() + 
+  geom_jitter(aes(x= '', y = rf.cc$PRED_R2_COR), alpha = 0.2, colour = 'deepskyblue4', width = 0.38) +
+  geom_boxplot(aes(x= '', y = rf.cc$PRED_R2_COR), fill="deepskyblue", alpha = 0.7) +
+  labs(x = '', y = expression(R^{2} ~ "of predictions from random forest models on test set")) +
+  scale_y_continuous(breaks = c(0.0,0.25,0.5,0.75))
+
+ggplot() + 
+  geom_density(aes(x=  rf.cc$OOB_R2_COR), fill="deepskyblue3", col = "deepskyblue4", alpha = 0.6) +
+  geom_segment(aes(x=mean(rf.cc$OOB_R2_COR), xend=mean(rf.cc$OOB_R2_COR), y=0, yend=3.07), linetype = "dashed", color = "darkblue") +
+  labs(y = "Density", x = expression(R^{2} ~ "of cross-validated random forest models")) +
+  theme(axis.text.x = element_text(size = 14), axis.text.y = element_text(size = 14), axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16))
+
+boxplot = melt(rf.cc[,c(1,3)])
+ggplot(aes(x=value, col = variable, fill = variable), data = boxplot) +
+#  geom_histogram(aes(y=..density..), position="identity", alpha=0.2, binwidth = 0.05) +
+  geom_density(alpha=.2) +
+  geom_segment(aes(x=mean(rf.cc$OOB_R2_COR), xend=mean(rf.cc$OOB_R2_COR), y=0, yend=3.07), linetype = "dashed", color = "darkgreen") +
+  geom_segment(aes(x=mean(rf.cc$PRED_R2_COR), xend=mean(rf.cc$PRED_R2_COR), y=0, yend=2.4), linetype = "dashed", color = "firebrick") +
+  scale_color_manual(values=c("darkgreen", "firebrick"), labels = c("Out of bag samples", "Test sets predictions")) +
+  scale_fill_manual(values=c("darkgreen", "firebrick"), labels = c("Out of bag samples", "Test sets predictions")) +
+  labs(x="R squared", y="Density", col = "R squared values computed on:", fill = "R squared values computed on:") +
+  theme(legend.position = c(0.75,0.9), legend.background = element_rect(fill = "white", color = "white"), axis.text.x = element_text(
+    size = 14), axis.text.y = element_text(size = 14), axis.title.x = element_text(size = 16), axis.title.y = element_text(size = 16),
+    legend.title = element_text(size = 14), legend.text = element_text(size = 13))
+  
+# Rank of importance
+# All models
+rank.rf.imp = as.data.frame(t(apply(as.matrix(rf.cc[,c(5:56)]), 1, rank)))
+rank.rf.imp = 53-rank.rf.imp
+names(rank.rf.imp) = c('Season', "Season moment","Depth","Marine biome","Ocean region","Biogeographical province",
+                         "Latitude","Longitude","Max sampling depth","CO3","Alkalinity total","Calcite saturation state",
+                         "NO2","Si","NO3","Temperature","Salinity","Oxygen","Chlorophyll a","Opt. backscat. coef. 470nm",
+                         "Fluorescence","Moon phase","Sunshine duration","Iron 5m","Ammonium 5m","NO2 5m", "NO3 5m",
+                         "SST gradient", "Okubo Weiss","Lyapunov","Residence time","Euphotic zone depth","Mixed layer depth",
+                         "Depth of DCM","Depth max. Brunt Väisälä","Depth Max O2","Depth Min O2","Depth nitracline",
+                         "Carbon flux","Bathymetry","Coast Distance","Temperature seasonal anomaly","Salinity seasonal anomaly","Annual density",
+                         "Conductivity seasonal anomaly","Dissolved O2 seasonal anomaly","Annual % O2 saturation",
+                         "% O2 saturation seasonal anomaly", "Silicate seasonal anomaly","Nitrate seasonal anomaly","Phosphate seasonal anomaly",
+                         "Upper size fraction")
+boxplot = melt(as.matrix(rank.rf.imp))
+bpall = ggplot() + geom_boxplot(aes(x = reorder(Var2,value,FUN=median), y = value), data = boxplot) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, face="bold")) +
+  labs(x = "", y = "Rank of importance in random forest regressions")
+bpall
+rm(boxplot, bpall)
+
+# Mean Rsquared depending on the most important variable
+mean.rsq.per1strankedvar = data.frame(variable = c(0), mean.rsq = c(0), nmodels = c(0))
+for(i in c(1:52)) {
+  n = names(rank.rf.imp)[i]
+  m = mean(rf.cc[which(row.names(rf.cc) %in% row.names(rank.rf.imp[which(rank.rf.imp[,i]==1),])),1],na.rm=T)
+  nm = nrow(rank.rf.imp[which(rank.rf.imp[,i]==1),])
+  mean.rsq.per1strankedvar[i,1] = n
+  mean.rsq.per1strankedvar[i,2] = m
+  mean.rsq.per1strankedvar[i,3] = nm
+}
+mean.rsq.per1strankedvar$variable = reorder(mean.rsq.per1strankedvar$variable, -mean.rsq.per1strankedvar$mean.rsq)
+ggplot() + geom_col(aes(x=variable,y=mean.rsq, fill=log(nmodels)), data = mean.rsq.per1strankedvar) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, face="bold"))
+rm(rank.rf.imp,mean.rsq.per1strankedvar)
+
+
+##############    Ordination of highest Rsquared CCs ####
+
+# We need to homogeneize the names of CCs among datasets
+row.names(rf.cc)[which(row.names(rf.cc)=="CC_1e.05")] = "CC_100000"
+row.names(rf.cc)[which(row.names(rf.cc)=="CC_2e.05")] = "CC_200000"
+cc_annot$CC_ID[which(cc_annot$CC_ID == "CC_1e+05")] = "CC_100000"
+cc_annot$CC_ID[which(cc_annot$CC_ID == "CC_2e+05")] = "CC_200000"
+cc_COGCat$CC_ID[which(cc_COGCat$CC_ID == "CC_1e+05")] = "CC_100000"
+cc_COGCat$CC_ID[which(cc_COGCat$CC_ID == "CC_2e+05")] = "CC_200000"
+names(abund_cc)[which(names(abund_cc)=="CC_1e+05")] = "CC_100000"
+names(abund_cc)[which(names(abund_cc)=="CC_2e+05")] = "CC_200000"
+names(abund_cc_var)[which(names(abund_cc_var)=="CC_1e.05")] = "CC_100000"
+names(abund_cc_var)[which(names(abund_cc_var)=="CC_2e.05")] = "CC_200000"
+
+# We select only PFCs corresponding to models with Rsquared > 0.5
+abund_cc_rsq50 = abund_cc_var[,which(names(abund_cc_var) %in% row.names(rf.cc[which(rf.cc$OOB_R2_COR>0.50),]))]
+
+# First let's try a CA
+afc_50 = cca(abund_cc_rsq50)
+#summary(afc_50) #29.6% on two axis
+#plot(afc_50) # quite nice distribution ! Let's explore it with a nicer triplot :
+# Sites in background
+station <- scores(afc_50, scaling=2, choices = c(1:3))$sites
+station = as.data.frame(station)
+station = merge(station, envi_cc_ml, by = "row.names")
+rownames(station) = station[,1]
+station = station[,-1]
+station = station[,c(1,2,3,9)]
+station[,4] = sub(".*\\[(.*)\\].*", "\\1", station[,4], perl=TRUE)
+station = within(station,Biogeographical.province <- factor(Biogeographical.province,levels=c("ANTA","FKLD", "SATL","BENG","GUIA","CARB","NAST-E","NAST-W","GFST", 
+                                                                                            "MEDI","REDS", "ARAB","MONS","EAFR","ISSG", "CAMR","NPST","PNEC","PEOD","SPSG","CHIL")))
+ccscore <- scores(afc_50, scaling=2, choices = c(1:3))$species
+ccscore = as.data.frame(ccscore)
+gafc <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore$CA1, y = ccscore$CA2),size = 0.5, alpha = 0.4) +
+  geom_point(aes(station[,1], station[,2], col = station[,4]), size = 3.5, alpha = 0.95)+
+  scale_color_manual(values = c("#993366","#9966CC", "#66CCFF","#3399CC","#339999","#0066CC","#003399","#000099","#003366", 
+                                "#FFCC33","#FFFF33", "#99FF66","#33CC00","#339900","#336600","#CC6666", "#FF9966","#FF6633","#CC0000","#990000","#660000"))  +
+  labs(col = "Longhurst province") +
+  #  xlab("RDA1 (61.13%)") +  ylab("RDA2 (23.42%)") #rsq75
+  xlab("CA1 (16.28%)") +  ylab("CA2 (13.36%)")  #rsq50
+# Adding segments for the species scores
+gafc
+
+# Now we can go further with a CCA
+cca_cc_rsq50 = cca(abund_cc_rsq50 ~ ., data = envi_cc_ml)
+#summary(cca_cc_rsq50) # 30.53% on two axis
+#RsquareAdj(cca_cc_rsq50) # 75.7%
+# Select most informative environmental drivers
+set.seed(1994)
+cca.step.both = ordistep(cca(abund_cc_rsq50~1,data=envi_cc_ml), scope=formula(cca_cc_rsq50), direction="both", pstep=1000)
+#formula(cca.step.both)
+ # cca.step.both = cca(abund_cc_rsq50 ~ Biogeographical.province + Season.moment + Depth +
+ # Depth.euph.zone + Depth.Min.O2 + Iron.5m + Fluorescence +
+ # Gradient.Surface.temp.SST. + Calcite.saturation.state + Moon.phase.prop +
+ # Alkalinity.total + NO3.5m + C_se + Ocean.region + Temperature +
+ # Salinity + ChlorophyllA, data = envi_cc_ml)
+
+res.cca=cca(formula=formula(cca.step.both), data=envi_cc_ml)
+summary(res.cca) # 28.54% on two axis
+RsquareAdj(res.cca) # 68.2%
+#anova.cca(res.cca, by = "axis") 
+# CCA1      1   0.35794 69.8736  0.001 ***
+# CCA2      1   0.29561 57.7063  0.001 ***
+#   CCA3      1   0.19480 38.0266  0.001 ***
+#   CCA4      1   0.18239 35.6057  0.001 ***
+#   CCA5      1   0.08818 17.2132  0.001 ***
+#   CCA6      1   0.05307 10.3596  0.001 ***
+#   CCA7      1   0.04347  8.4856  0.001 ***
+#   CCA8      1   0.03769  7.3580  0.009 ** 
+#   CCA9      1   0.03159  6.1668  0.026 *  
+
+# Triplot
+# Sites in background
+station <- scores(res.cca, scaling=2, choices = c(1:3))$sites
+station = as.data.frame(station)
+station = merge(station, envi_cc_ml, by = "row.names")
+rownames(station) = station[,1]
+station = station[,-1]
+station = station[,c(1,2,3,9)]
+station[,4] = sub(".*\\[(.*)\\].*", "\\1", station[,4], perl=TRUE)
+station = within(station,Biogeographical.province <- factor(Biogeographical.province,levels=c("ANTA","FKLD", "SATL","BENG","GUIA","CARB","NAST-E","NAST-W","GFST", 
+                                                                                            "MEDI","REDS", "ARAB","MONS","EAFR","ISSG", "CAMR","NPST","PNEC","PEOD","SPSG","CHIL")))
+# CC scores in the background as well
+ccscore <- scores(res.cca, scaling=2, choices = c(1:3))$species
+ccscore = as.data.frame(ccscore)
+
+g1 <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore$CCA1, y = ccscore$CCA2),size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(station[,1], station[,2], col = station[,4]), size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("#993366","#9966CC", "#66CCFF","#3399CC","#339999","#0066CC","#003399","#000099","#003366", 
+                                "#FFCC33","#FFFF33", "#99FF66","#33CC00","#339900","#336600","#CC6666", "#FF9966","#FF6633","#CC0000","#990000","#660000"))  +
+  labs(col = "Longhurst province") +
+  xlab("CCA1 (15.38%)") +  ylab("CCA2 (13.17%)")
+
+#scale_color_manual(values = c("#990000","#FF0000","#FFCC33","#FFFF00","#339900","#66CCFF","#003399","#FF00CC")) 
+
+# Adding envi variables 
+envi.scores <- scores(res.cca, choices = 1:3, display="bp", scaling=2)[-c(1:31,42),] # we get rid of biogeo provinces
+#row.names(envi.scores) = c("Irradiance seasonal anomaly", "Water residence time", "Temperature", "MLD", "Moon phase", "Lyapunov exponent", "NO2")
+row.names(envi.scores) = c("Euphotic zone depth", "O2 minimum depth", "Iron 5m", "Fluorescence", "SST gradient", "Calcite saturation state", "Moon phase", "Total Alkalinity", "NO3 5m",  "Conductivity seasonal anomaly", "Temperature", "Salinity", "Chlorophyll a")
+
+g12 <- g1 + geom_segment(data=as.data.frame(envi.scores),aes(xend = CCA1*3.8, yend = CCA2*3.8),x=0,y=0,size = 0.5, linetype="F1",color = 'steelblue4',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(envi.scores[,1]*4, envi.scores[,2]*4, label=rownames(envi.scores)), color="steelblue4")
+g12
+
+# And for the 3rd and fourth axis
+# Sites in background
+station <- scores(res.cca, scaling=2, choices = c(1:4))$sites
+station = as.data.frame(station)
+station = merge(station, envi_cc_ml, by = "row.names")
+rownames(station) = station[,1]
+station = station[,-1]
+station = station[,c(1,2,3,4,10)]
+station[,5] = sub(".*\\[(.*)\\].*", "\\1", station[,5], perl=TRUE)
+station = within(station,Biogeographical.province <- factor(Biogeographical.province,levels=c("ANTA","FKLD", "SATL","BENG","GUIA","CARB","NAST-E","NAST-W","GFST", 
+                                                                                            "MEDI","REDS", "ARAB","MONS","EAFR","ISSG", "CAMR","NPST","PNEC","PEOD","SPSG","CHIL")))
+# CC scores in the background as well
+ccscore <- scores(res.cca, scaling=2, choices = c(1:4))$species
+ccscore = as.data.frame(ccscore)
+
+g1 <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore$CCA3, y = ccscore$CCA4),size = 0.5, alpha = 0.4) +
+  geom_point(aes(station[,3], station[,4], col = station[,5]), size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("#993366","#9966CC", "#66CCFF","#3399CC","#339999","#0066CC","#003399","#000099","#003366", 
+                                "#FFCC33","#FFFF33", "#99FF66","#33CC00","#339900","#336600","#CC6666", "#FF9966","#FF6633","#CC0000","#990000","#660000"))  +
+  labs(col = "Longhurst province") +
+  xlab("CCA3 (8.91%)") +  ylab("CCA4 (8.5%)")
+
+#scale_color_manual(values = c("#990000","#FF0000","#FFCC33","#FFFF00","#339900","#66CCFF","#003399","#FF00CC")) 
+
+# Adding envi variables 
+envi.scores <- scores(res.cca, choices = 1:4, display="bp", scaling=2)[-c(1:31,42),] # we get rid of biogeo provinces
+#row.names(envi.scores) = c("Irradiance seasonal anomaly", "Water residence time", "Temperature", "MLD", "Moon phase", "Lyapunov exponent", "NO2")
+row.names(envi.scores) = c("Euphotic zone depth", "O2 minimum depth", "Iron 5m", "Fluorescence", "SST gradient", "Calcite saturation state", "Moon phase", "Total Alkalinity", "NO3 5m",  "Conductivity seasonal anomaly", "Temperature", "Salinity", "Chlorophyll a")
+
+g34 <- g1 + geom_segment(data=as.data.frame(envi.scores),aes(xend = CCA3*4, yend = CCA4*4),x=0,y=0,size = 0.5, linetype="F1",color = 'steelblue4',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(envi.scores[,3]*4.2, envi.scores[,4]*4.2, label=rownames(envi.scores)), color="steelblue4")
+g34
+
+##############    Distribution of R2 in CCA space
+
+ccscore_withR2=merge(ccscore,rf.cc, by="row.names", all.y=F)
+
+g5 <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore_withR2$CCA1, y = ccscore_withR2$CCA2, col = ccscore_withR2$OOB_R2_COR), alpha = 0.6) +
+  scale_color_viridis_c(breaks=c(0.5,0.6,0.7,0.8,0.9)) +
+  labs(col="R-squared values") +
+  xlab("CCA1 (15.38%)") +  ylab("CCA2 (13.17%)")
+
+##############    Exploration of functional annotations among hlePFCs     #########
+
+cc_50_Kegg = CC2Kegg[which(CC2Kegg$CC_ID %in% names(abund_cc_rsq50)),]
+#write.table(cc_50_Kegg, "/home/faure/Documents/PhD/MAGs_Project/Data_tables/AnnotKOFAM/CC_rsq50_Kegg", row.names = F, quote = F)
+
+# Which pathways are conserved/not conserved in the 2444
+pathway2CC = merge(CC2Kegg, KeggToPathway, by.x = 'KeggID', by.y = 'Kegg_ID')
+
+pathway2CC_rsq50 = pathway2CC[which(pathway2CC$CC_ID %in% names(abund_cc_rsq50)),]
+#length(unique(pathway2CC_rsq50$Pathway_Description)) #247
+
+# What pathways are selected
+Stats_Pathways = as.data.frame(table(pathway2CC$Pathway_Description))
+Stats_Pathways_rsq50 = as.data.frame(table(pathway2CC_rsq50$Pathway_Description))
+Stats_Pathways = merge(Stats_Pathways, Stats_Pathways_rsq50, by = "Var1")
+rm(Stats_Pathways_rsq50)
+names(Stats_Pathways) = c("Pathway_Description", "Freq.tot", "Freq.sel")
+Stats_Pathways$perc.pres = Stats_Pathways$Freq.sel / Stats_Pathways$Freq.tot *100
+#summary(Stats_Pathways)
+Stats_Pathways = Stats_Pathways %>% arrange(desc(perc.pres))
+Stats_Pathways[which(Stats_Pathways$Freq.tot>1000),]
+ggplot() + geom_col(aes(x=reorder(Pathway_Description, -perc.pres), y = perc.pres), data = Stats_Pathways[which(Stats_Pathways$Freq.tot > 1000 & Stats_Pathways$perc.pres > 6.2),])  +
+  geom_hline(yintercept = 6.2, col = "red") +
+  theme(axis.text.x = element_text(angle = 90))
+
+# We build a table combining annotations and positions in CCA
+annot_explor = merge(ccscore, cc_50_Kegg, by.x = "row.names", by.y = "CC_ID", all = T)
+names(annot_explor)[1] = "CC_ID"
+annot_explor = merge(annot_explor, KeggToPathway, by.x = "KeggID", by.y = "Kegg_ID", all.x = T)
+annot_explor = annot_explor[order(annot_explor$CC_ID),]
+
+# Detecting pathways with positions different from 0 on each axis
+p.value.CCA1 = data.frame(Pathway_Description = c(), p.value = c())
+for (i in c(1:length(unique(annot_explor$Pathway_Description)))) {
+  p.value.CCA1[i,1] = unique(annot_explor$Pathway_Description)[i]
+  if (length(annot_explor$CCA1[which(annot_explor$Pathway_Description==unique(annot_explor$Pathway_Description)[i])]) < 2) {
+    p.value.CCA1[i,2] = "NA"
+  }
+    else {
+      p.value.CCA1[i,2] = t.test(annot_explor$CCA1[which(annot_explor$Pathway_Description==unique(annot_explor$Pathway_Description)[i])])$p.value
+    }
+}
+data.CCA1 = annot_explor[which(annot_explor$Pathway_Description %in% p.value.CCA1[which(as.numeric(p.value.CCA1$V2) < 0.00001),1]),]
+data.CCA1 = merge(data.CCA1,p.value.CCA1, by.x = "Pathway_Description", by.y = "V1")
+ggplot() + geom_boxplot(aes(x=reorder(Pathway_Description,-CCA1,FUN=median), y = CCA1, col = as.numeric(V2)), data = data.CCA1) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, face="bold")) +
+  scale_color_continuous(limits = c(1e-100,0.00001), breaks = c(1e-50, 0.00001), guide=guide_colourbar(reverse = TRUE), low="#5EB7F8", high="#1A334B") +
+  labs(x = "", y = "Position on CCA1 axis (20.62%)", col = "p-value") +
+  ylim(-2,2.5)
+rm(data.CCA1, p.value.CCA1)
+
+p.value.CCA2 = data.frame(Pathway_Description = c(), p.value = c())
+for (i in c(1:length(unique(annot_explor$Pathway_Description)))) {
+  p.value.CCA2[i,1] = unique(annot_explor$Pathway_Description)[i]
+  if (length(annot_explor$CCA2[which(annot_explor$Pathway_Description==unique(annot_explor$Pathway_Description)[i])]) < 2) {
+    p.value.CCA2[i,2] = "NA"
+  }
+  else {
+    p.value.CCA2[i,2] = t.test(annot_explor$CCA2[which(annot_explor$Pathway_Description==unique(annot_explor$Pathway_Description)[i])])$p.value
+  }
+}
+data.CCA2 = annot_explor[which(annot_explor$Pathway_Description %in% p.value.CCA2[which(as.numeric(p.value.CCA2$V2) < 0.01),1]),]
+data.CCA2 = merge(data.CCA2,p.value.CCA2, by.x = "Pathway_Description", by.y = "V1")
+ggplot() + geom_boxplot(aes(x=reorder(Pathway_Description,-CCA2,FUN=median), y = CCA2, col = as.numeric(V2)), data = data.CCA2) +
+  theme(axis.text.x = element_text(angle = 65, hjust = 1, face="bold", size = 11)) +
+  labs(x = "", y = "Position on CCA2 axis (17.03%)", col = "p-value") +
+  scale_color_continuous(limits = c(1e-100,0.01), breaks = c(1e-50, 0.001,0.005,0.01), low="#5EB7F8", high="#1A334B", guide = guide_colourbar(reverse=T)) +
+  ylim(-1.5,3)
+rm(data.CCA2, p.value.CCA2)
+
+# Exploration of unknowns distribution on CCA axes
+Unknown_cc_kegg = cc_stats_rf50[cc_stats_rf50$Unknowns.kegg==1,1]
+ccscore$is.annotated = "Known"
+ccscore[which(row.names(ccscore) %in% Unknown_cc_kegg),]$is.annotated = "Unknown"
+a = ggplot() + geom_density(aes(CCA1, fill = is.annotated, col = is.annotated), alpha = 0.2, data = ccscore) +
+  xlim(-3,2) + 
+  labs(y = "Density of connected components", x = "Coordinates along CCA1 (15.38%)", fill = "Kegg pathway\nannotation", col = "Kegg pathway\nannotation")
+a
+
+b = ggplot() + geom_density(aes(CCA2, fill = is.annotated, col = is.annotated), alpha = 0.2,  data = ccscore) +
+  xlim(-4,2) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA2 (13.17%)", fill = "Kegg pathway\nannotation", col = "Kegg pathway\nannotation")
+b
+
+# Same for eggNOG unknowns:
+unkegg_expl = data.frame(CC_ID = row.names(ccscore), CCA1 = ccscore$CCA1, CCA2 = ccscore$CCA2)
+unkegg_expl$is.annotated = "Known"
+unkegg_expl$is.annotated[which(unkegg_expl$CC_ID %in% cc_stats[which(cc_stats$Unknowns.eggnog == 1),1])] = "Unknown"
+c = ggplot() + geom_density(aes(CCA1, fill = is.annotated, col = is.annotated), alpha = 0.4, data = unkegg_expl) +
+  xlim(-3,2) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA1 (15.38%)", fill = "EggNOG annotation", col = "EggNOG annotation")
+
+d = ggplot() + geom_density(aes(CCA2, fill = is.annotated, col = is.annotated), alpha = 0.4, data = unkegg_expl) +
+  xlim(-4,2) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA2 (13.17%)", fill = "EggNOG annotation", col = "EggNOG annotation")
+
+mean(density(unkegg_expl[which(unkegg_expl$is.annotated=="Known"),2])$y-density(unkegg_expl[which(unkegg_expl$is.annotated=="Unknown"),2])$y)
+
+######## Convex Hulls of interesting KEGGpathways in the CCA space #########
+
+back.convhull = ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, col = "grey", size = 0.5, alpha = 0.2)
+
+path.list=c("Quorum sensing", "ABC transporters", "Biosynthesis of antibiotics",
+            "Carbon fixation pathways in prokaryotes", "Nitrogen metabolism", "Methane metabolism")
+graph.list = list()
+col.vec = c("orange3", "orange3", "orange3",
+            "springgreen4", "springgreen4", "springgreen4")
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.chull = annot_explor[which(annot_explor$Pathway_Description == focal.path),c(3:6)]
+  hpts12 <- chull(path.chull[,c(1:2)])
+  hpts12 <- c(hpts12, hpts12[1])
+  g = back.convhull + geom_polygon(aes(x=CCA1, y=CCA2), data = path.chull[hpts12,], fill = col.vec[i], col = col.vec[i], alpha = 0.5) +
+    geom_point(aes(x=CCA1, y=CCA2), data = annot_explor[which(annot_explor$Pathway_Description==focal.path),], 
+               col = "yellow", size =1.3) +
+    geom_point(aes(x=CCA1, y=CCA2), data = annot_explor[which(annot_explor$Pathway_Description==focal.path),], 
+               col = "grey10", size =1.3, pch = 1, alpha=0.5) +
+    geom_point(aes(x=mean(CCA1), y = mean(CCA2)), data = annot_explor[which(annot_explor$Pathway_Description==focal.path),], color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+    labs(title = path.list[i], x = "CCA1 (15.38%)", y = "CCA2 (13.17%)") +
+    theme(text=element_text(size = 7))
+  graph.list[[i]] = g
+}
+# Chull for eggnog unknowns
+path.chull = annot_explor[which(annot_explor$CC_ID %in% cc_stats$CC_ID[which(cc_stats$Unknowns.eggnog == 1)]),c(3:6)]
+path.chull = distinct(path.chull) # 192 fully unknown CCs in eggNOG annots
+hpts12 <- chull(path.chull[,c(1:2)])
+hpts12 <- c(hpts12, hpts12[1])
+g = back.convhull + geom_polygon(aes(x=CCA1, y=CCA2), data = path.chull[hpts12,], fill = "grey20", col = "grey20", alpha = 0.5) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+          col = "yellow", size =1.3) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+             col = "grey10", size = 1.3, pch = 1, alpha=0.5) +  
+  geom_point(aes(x=mean(CCA1), y = mean(CCA2)), data = path.chull, color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  labs(title = "EggNOG NA", x = "CCA1 (15.38%)", y = "CCA2 (13.17%)") +
+  theme(text=element_text(size = 7))
+graph.list[[length(graph.list)+1]] = g
+# Chull for KEGG unknowns
+path.chull = annot_explor[which(annot_explor$CC_ID %in% cc_stats$CC_ID[which(cc_stats$Unknowns.kegg == 1)]),c(3:6)]
+path.chull = distinct(path.chull) # 828 fully unknown CCs in eggNOG annots
+hpts12 <- chull(path.chull[,c(1:2)])
+hpts12 <- c(hpts12, hpts12[1])
+g = back.convhull + geom_polygon(aes(x=CCA1, y=CCA2), data = path.chull[hpts12,], fill = "grey20", col = "grey20", alpha = 0.5) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+             col = "yellow", size =1.3) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+             col = "grey10", size = 1.3, pch = 1, alpha=0.5) +  
+  geom_point(aes(x=mean(CCA1), y = mean(CCA2)), data = path.chull, color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  labs(title = "KEGG NA", x = "CCA1 (15.38%)", y = "CCA2 (13.17%)") +
+  theme(text=element_text(size = 7))
+graph.list[[length(graph.list)+1]] = g
+# Chull for dark hlePFCs
+path.chull = annot_explor[which(annot_explor$CC_ID %in% cc_stats$CC_ID[which(cc_stats$Unknowns.kegg == 1 & cc_stats$Unknowns.eggnog == 1 & cc_stats$Unknowns.taxo.Class==1)]),c(3:6)]
+path.chull = distinct(path.chull) # 828 fully unknown CCs in eggNOG annots
+hpts12 <- chull(path.chull[,c(1:2)])
+hpts12 <- c(hpts12, hpts12[1])
+g = back.convhull + geom_polygon(aes(x=CCA1, y=CCA2), data = path.chull[hpts12,], fill = "grey20", col = "grey20", alpha = 0.5) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+             col = "yellow", size =1.3) +
+  geom_point(aes(x=CCA1, y=CCA2), data = path.chull, 
+             col = "grey10", size = 1.3, pch = 1, alpha=0.5) +  
+  geom_point(aes(x=mean(CCA1), y = mean(CCA2)), data = path.chull, color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  labs(title = "Dark hlePFCs", x = "CCA1 (15.38%)", y = "CCA2 (13.17%)") +
+  theme(text=element_text(size = 7))
+graph.list[[length(graph.list)+1]] = g
+
+do.call("grid.arrange", c(graph.list,ncol=3))
+rm(path.chull, hpts12, focal.path, graph.list, path.list)
+
+# Interesting pathways : Synthesis and degradation of ketone bodies, Fatty acid biosynthesis, Fatty acid metabolism,
+# DNA replication, Carotenoid biosynthesis, Flagellar assembly, Pentose and glucuronate interconversions, 
+# Quorum sensing, ABC transporters, Biosynthesis of antibiotics, Nitrogen metabolism, Glycerophospholipid metabolism
+
+#####   Centroids of KEGG pathways in the CCA space #####
+
+# To compute one centroid for all pathways
+path.list = unique(annot_explor$Pathway_Description)
+path.centroid = data.frame(Pathway = path.list, x.coord = rep(0, length(path.list)), y.coord = rep(0,length(path.list)), 
+                           x.min= rep(0,length(path.list)), x.max= rep(0,length(path.list)), y.min= rep(0,length(path.list)),
+                           y.max= rep(0,length(path.list)), x.plusSD = rep(0,length(path.list)), x.minusSD = rep(0,length(path.list)),
+                           y.plusSD = rep(0,length(path.list)), y.minusSD = rep(0,length(path.list)), n.path = rep(0,length(path.list)))
+
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.centroid[i,2] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,3] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,4] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,5] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,6] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,7] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,8] = path.centroid[i,2] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,9] = path.centroid[i,2] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,10] = path.centroid[i,3] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,11] = path.centroid[i,3] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,12] = nrow(annot_explor[which(annot_explor$Pathway_Description == focal.path),])
+}
+
+# Which pathways are the most interesting ones ?
+allpatgraph = ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(x=x.coord, y=y.coord, col=log(n.path)), alpha=0.6, data=path.centroid[which(path.centroid$n.path>10),], size = 3) +
+  geom_point(aes(x=mean(ccscore$CCA1), y = mean(ccscore$CCA2)), color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  scale_color_viridis_c()
+path.centroid[which(path.centroid[,2]>0.5  & path.centroid$n.path>10),] # Nothing in CCA1>0.5
+path.centroid[which(path.centroid[,2]<(-0.75) & path.centroid$n.path>10),] # Glycosaminoglycan degradation / Atrazine degradation 
+path.centroid[which(path.centroid[,3]<(-0.25) & path.centroid$n.path>10),] # Ribosome / Pathogenic Escherichia coli infection / RNA polymerase / AMPK signaling pathway
+path.centroid[which(path.centroid[,3]>(0.25) & path.centroid$n.path>10),] # Chloroalkane and chloroalkene degradation
+
+# Specific pathways
+path.list=c("Glycosaminoglycan degradation", "Atrazine degradation", "Ribosome",
+            "Pathogenic Escherichia coli infection", "RNA polymerase","AMPK signaling pathway")
+path.centroid = data.frame(Pathway = path.list, x.coord = rep(0, length(path.list)), y.coord = rep(0,length(path.list)), 
+                           x.min= rep(0,length(path.list)), x.max= rep(0,length(path.list)), y.min= rep(0,length(path.list)),
+                           y.max= rep(0,length(path.list)), x.plusSD = rep(0,length(path.list)), x.minusSD = rep(0,length(path.list)),
+                           y.plusSD = rep(0,length(path.list)), y.minusSD = rep(0,length(path.list)), n.path = rep(0,length(path.list)),
+                           stringsAsFactors = FALSE)
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.centroid[i,2] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,3] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,4] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,5] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,6] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,7] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,8] = path.centroid[i,2] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,9] = path.centroid[i,2] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,10] = path.centroid[i,3] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,11] = path.centroid[i,3] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,12] = nrow(annot_explor[which(annot_explor$Pathway_Description == focal.path),])
+}
+
+# Add Dark matter PFCs
+cc_stats_rf50 = cc_stats[which(cc_stats$CC_ID %in% row.names(rf.cc[which(rf.cc$OOB_R2_COR>0.5),])),]
+focal.darkmatt = as.character(unique(cc_stats_rf50[which(cc_stats_rf50$Unknowns.eggnog == 1 & cc_stats_rf50$Unknowns.kegg == 1 & cc_stats_rf50$Unknowns.taxo.Class == 1),]$CC_ID))
+linedark = nrow(path.centroid)+1
+path.centroid[linedark,] = rep(0, 12)
+path.centroid[linedark,2] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,3] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,4] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,5] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,6] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,7] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,8] = path.centroid[7,2] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,9] = path.centroid[7,2] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,10] = path.centroid[7,3] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,11] = path.centroid[7,3] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,12] = length(focal.darkmatt)
+path.centroid[linedark,1] = "Microbial dark matter"
+
+allpatgraph = allpatgraph + geom_point(aes(x= x.coord, y = y.coord), col = "black", size = 4, shape = 20, data = path.centroid[linedark,])
+allpatgraph
+
+path.centroid = within(path.centroid,Pathway <- factor(Pathway,levels=c("AMPK signaling pathway","Ribosome", "Pathogenic Escherichia coli infection",
+                                                                        "RNA polymerase", "Atrazine degradation", "Glycosaminoglycan degradation",
+                                                                        "Microbial dark matter")))
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Pathway), height = 0.1, data = path.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Pathway), width = 0.1, data = path.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Pathway, size = n.path), data = path.centroid) +
+  scale_color_manual(values = c("darkorchid4", "darkorchid1","deeppink2", "firebrick", "darkorange1", "darkorange3", "black")) +
+  scale_size_continuous(range = c(5,12), breaks = c(15,50,100)) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.path)), col = "white", data = path.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (20.62%)", y = "CCA2 (17.03%)", size = "Number of associated PFCs", col = "Metabolic pathway barycenter") +
+  xlim(-2,2) +
+  ylim(-4,2)
+
+##########    Exploration of the taxonomy of hlePFCs in the CCA space       #########
+
+CC_2_Mag$Protein_ID = row.names(CC_2_Mag)
+CC_2_Mag = CC_2_Mag[,c(1,95)]
+CC_2_Mag$Mag_ID = substr(CC_2_Mag$Protein_ID, 1, 18)
+
+CC_2_Mag_Rsq50 = CC_2_Mag[which(CC_2_Mag$CC_ID %in% names(abund_cc_rsq50)),] #52536 Proteins are conserved in the 14585 CCs --> Mean size = 3.6
+#max(table(droplevels(CC_2_Mag_Rsq50$CC_ID))) # Max size = 222
+#min(table(droplevels(CC_2_Mag_Rsq50$CC_ID))) # Min size = 2
+#median(table(droplevels(CC_2_Mag_Rsq50$CC_ID))) # Median = 2
+
+#length(unique(CC_2_Mag$Mag_ID)) #885 MAGs in the CCS
+#length(unique(CC_2_Mag_Rsq50$Mag_ID)) #862 Mags represented in the 2444 CCs with more than 50% Rsquare --> 97% of them.
+
+taxo_explor = merge(ccscore, CC_2_Mag_Rsq50, by.x = "row.names", by.y = "CC_ID", all.y = T)
+#head(taxo_explor)
+
+#Mediterranean side of the CCA (CCA1<-1):
+nrow(taxo_explor[which(taxo_explor$CCA1<(-1)),]) #8736 Proteins
+length(unique(taxo_explor[which(taxo_explor$CCA1<(-1)),1])) #3345 CCs
+length(unique(taxo_explor[which(taxo_explor$CCA1<(-1)),6])) #193 MAGs
+table(substr(taxo_explor[which(taxo_explor$CCA1<(-1)),6], 6,8)) #5537 proteins from mediterranean MAGs (63%), second highest = 1942 proteins from PSE
+table(substr(unique(taxo_explor[which(taxo_explor$CCA1<(-1)),6]),6,8)) # 85 MAGs from mediterranean assembly (44%), followed only by PSE and ANE with 17
+
+#Indian ocean side of the CCA (CCA1>1):
+nrow(taxo_explor[which(taxo_explor$CCA1>1),]) #239 Proteins
+length(unique(taxo_explor[which(taxo_explor$CCA1>1),1])) #79 CCs
+length(unique(taxo_explor[which(taxo_explor$CCA1>1),6])) #23 MAGs
+table(substr(taxo_explor[which(taxo_explor$CCA1>1),6], 6,8)) #197 proteins from ANW MAGs, second highest = 13 proteins from ION
+table(substr(unique(taxo_explor[which(taxo_explor$CCA1>1),6]),6,8)) # 5 MAGs from ANW, and 5 from ION
+
+#Southern ocean side of the CCA (CCA2<1):
+nrow(taxo_explor[which(taxo_explor$CCA2<(-1)),]) #3431 Proteins
+length(unique(taxo_explor[which(taxo_explor$CCA2<(-1)),1])) #950 proteins
+length(unique(taxo_explor[which(taxo_explor$CCA2<(-1)),6])) #402 MAGs
+table(substr(taxo_explor[which(taxo_explor$CCA2<(-1)),6], 6,8)) #729 proteins from PSE MAGs, second highest = 569 proteins from ANW
+table(substr(unique(taxo_explor[which(taxo_explor$CCA2<(-1)),6]),6,8)) # 77 MAGs from MED, and 70 from PSE
+
+
+#######   Barycenter of phylums  #####
+# First we need to create a taxo_explor table perfectly analogous to annot_explor
+taxo_explor = merge(taxo_explor, mags_taxo, by.x = "Mag_ID", by.y = "MAG")
+names(taxo_explor)[2] = "CC_ID"
+
+taxo.list=c("Candidatus_Marinimicrobia ","Verrucomicrobia","Spirochaetes", "Bacteroidetes", "Firmicutes", "Planctomycetes")
+# taxo.list = unique(taxo_explor$Phylum)
+# taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid = within(taxo.centroid,Taxon <- factor(Taxon,levels=c("Bacteroidetes", "Candidatus_Marinimicrobia ","Verrucomicrobia" , "Planctomycetes", "Spirochaetes",  "Firmicutes")))
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Class barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(10,100,1000)) +
+  scale_color_manual(values = c("firebrick","gold3", "springgreen4", "springgreen2", "darkorchid2", "darkorchid4")) +
+  xlim(-2,2) +
+  ylim(-4,2)
+
+#######   Barycenter of classes  #####
+
+taxo.list=c("Gammaproteobacteria","Flavobacteriia","Prochlorales", "Opitutae",
+            "Sphingobacteriia", "Spirochaetia", "Betaproteobacteria")
+# taxo.list = unique(taxo_explor$Class)
+# taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid = within(taxo.centroid,Taxon <- factor(Taxon,levels=c("Gammaproteobacteria","Flavobacteriia","Prochlorales", "Opitutae",
+                                                                    "Sphingobacteriia", "Spirochaetia", "Betaproteobacteria")))
+
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Class barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(50,500,1500,3000)) +
+  scale_color_manual(values = c("gold3", "darkorange3", "limegreen", "springgreen3", "darkorchid4", "darkorchid2","firebrick")) +
+  xlim(-2,2) +
+  ylim(-4,2)
+
+
+# Barycenter of order
+
+ taxo.list = unique(taxo_explor$Order)
+ taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid[taxo.centroid$x.coord<(-1),]
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Order barycenter") 
+
+
+# Barycenter of family
+
+ taxo.list = unique(taxo_explor$Family)
+ taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid[taxo.centroid$x.coord<(-1),]
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Genus barycenter") 
+
+# Barycenter of genus
+
+ taxo.list = unique(taxo_explor$Genus)
+ taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid[taxo.centroid$x.coord<(-1),]
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Genus barycenter") 
+
+####### Exploration of the distribution of a few unknown CC #######
+
+# Step 1 : find nice candidates CC, with only NA even in eggnog and good CCA position
+cc_unk_egg_score = ccscore[which(row.names(ccscore) %in% cc_stats[which(cc_stats$Unknowns.eggnog == 1.0 & cc_stats$Unknowns.kegg ==1.0),1]),]
+path.chull = cc_unk_egg_score
+hpts12 <- chull(path.chull[,c(1:2)])
+hpts12 <- c(hpts12, hpts12[1])
+back.convhull + geom_polygon(aes(x=CCA1, y=CCA2), data = path.chull[hpts12,],  fill = "grey20", col = "grey20", alpha = 0.5) +
+  #    geom_point(aes(x=CCA1, y=CCA2), data = annot_explor[is.na(annot_explor$KeggID),], 
+  #               col = "gold2", size =1.5)
+  geom_point(aes(x=CCA1, y=CCA2), data = cc_unk_egg_score, 
+             col = "yellow", size =1.3) +
+  geom_point(aes(x=CCA1, y=CCA2), data = cc_unk_egg_score, 
+             col = "grey10", size =1.3, pch = 1, alpha=0.5) +
+  labs(title = "NA", x = "CCA1 (15.38%)", y = "CCA2 (13.17%)") +
+  theme(text=element_text(size = 7))
+
+# Exploration of polar side
+# cc_unk_egg_score[which(cc_unk_egg_score$CCA2<(-1)),]
+# cc_stats[which(cc_stats$CC_ID %in% rownames(cc_unk_egg_score[which(cc_unk_egg_score$CCA2<(-1)),])),]
+# cc_annot[which(cc_annot$CC_ID == "CC_210456"),]
+# cc_annot[which(cc_annot$CC_ID == "CC_102286"),]
+# cc_annot[which(cc_annot$CC_ID == "CC_233673"),]
+# rf.cc[which(row.names(rf.cc)=="CC_210456"),]
+# rf.cc[which(row.names(rf.cc)=="CC_102286"),]
+# rf.cc[which(row.names(rf.cc)=="CC_233673"),]
+
+# Exploration of Indian side
+# cc_unk_egg_score[which(cc_unk_egg_score$CCA1>(1.4)),]
+# cc_stats[which(cc_stats$CC_ID %in% rownames(cc_unk_egg_score[which(cc_unk_egg_score$CCA1>(1.45)),])),]
+# cc_annot[which(cc_annot$CC_ID == "CC_90935"),]
+# cc_annot[which(cc_annot$CC_ID == "CC_90471"),]
+# cc_annot[which(cc_annot$CC_ID == "CC_90382"),]
+# rf.cc[which(row.names(rf.cc)=="CC_90935"),]
+# rf.cc[which(row.names(rf.cc)=="CC_90471"),]
+# rf.cc[which(row.names(rf.cc)=="CC_90382"),]
+
+a= ggplot() + geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_102286")]), 
+                         col = "hotpink1", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #102286 (CCA2 = -3.16) ")
+b= ggplot() + geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_210456")]), 
+                      col = "darkorchid1", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #210456 (CCA2 = -3.15) ")
+c= ggplot() +  geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_233673")]), 
+             col = "darkmagenta", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #233673 (CCA2 = -3.33) ")
+
+d= ggplot() +  geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_90935")]), 
+                          col = "darkolivegreen2", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #90935 (CCA1 = 1.52) ")
+e= ggplot() +  geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_90471")]), 
+             col = "darkolivegreen3", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #90471 (CCA1 = 1.52) ")
+f= ggplot() +  geom_point(aes(x=envi_cc$Temperature, y=abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_90382")]), 
+                          col = "darkolivegreen4", alpha = 0.8, size = 2) +
+  labs(x="Temperature (°C)", y = "Norm. sequence abundance", title = "PFC #90382 (CCA1 = 1.48) ")
+
+multiplot(a,b,c,d,e,f, cols = 2)
+
+###   Add 3 examples of darkmatter PFCs associated with mediterranean side
+
+#ccscore[which(row.names(ccscore) %in% focal.darkmatt & ccscore$CCA1<(-1.3)),]
+# CC_172397 -1.517071 0.5002713 -0.6429674
+# CC_172465 -1.751272 0.5129982 -0.7898542
+# CC_26732  -1.381902 0.3223239 -0.2293910
+
+envi_cc$Med_NoMed = rep("Not Mediterranean", nrow(envi_cc))
+envi_cc[which(envi_cc$Biogeographical.province == "[MEDI] Mediterranean Sea, Black Sea Province (MRGID:21465)"),]$Med_NoMed = "Mediterranean"
+g = ggplot() + geom_boxplot(aes(x=envi_cc$Med_NoMed, y= abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_172397")],
+                                fill = envi_cc$Med_NoMed)) +
+  scale_fill_manual(values = c("Gold1", "Grey30")) +
+  theme(legend.position = "none", axis.text.x = element_text(size = 11)) +
+  labs(x=NULL, y = "Norm. sequence abundance", title = "PFC #172397 (CCA1 = -1.52)")
+
+h = ggplot() + geom_boxplot(aes(x=envi_cc$Med_NoMed, y= abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_172465")],
+                                fill = envi_cc$Med_NoMed)) +
+  scale_fill_manual(values = c("Gold2", "Grey30")) +
+  theme(legend.position = "none", axis.text.x = element_text(size = 11)) +
+  labs(x=NULL, y = "Norm. sequence abundance", title = "PFC #172465 (CCA1 = -1.75)")
+
+i = ggplot() + geom_boxplot(aes(x=envi_cc$Med_NoMed, y= abund_cc_rsq50[,which(names(abund_cc_rsq50) == "CC_26732")],
+                                fill = envi_cc$Med_NoMed)) +
+  scale_fill_manual(values = c("Gold3", "Grey30")) +
+  theme(legend.position = "none", axis.text.x = element_text(size = 11)) +
+  labs(x=NULL, y = "Norm. sequence abundance", title = "PFC #26732 (CCA1 = -1.38)")
+
+multiplot(a,b,c,d,e,f,g,h,i, cols = 3)
+
+#########   Testing for the Assembly effect  #########
+
+taxo_explor$Assembly = substr(taxo_explor$Mag_ID,6,8)
+
+taxo.list=c("MED","ASE","RED","ION", "ANW", "SOC")
+#taxo.list = unique(taxo_explor$Assembly)
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Assembly == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid = within(taxo.centroid,Taxon <- factor(Taxon,levels=c("ASE","ANW","MED", "RED",
+                                                                        "ION", "SOC")))
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x = "CCA1 (15.38%)", y = "CCA2 (13.17%)", size = "Number of associated PFCs", col = "Assembly barycenter") +
+  scale_size_continuous(range = c(10,15), breaks = c(1000,4000,8000)) +
+  scale_color_manual(values=c("darkblue", "lightblue", "#FFCC33", "firebrick", "darkgreen", "Darkorchid2")) +
+  xlim(-2,2) +
+  ylim(-4,2)
+
+```
+
+
+```{r}
+# We can now try to run a CCA on all PFC with R2 > 0.25
+abund_cc_rsq25 = abund_cc_var[,which(names(abund_cc_var) %in% row.names(rf.cc[which(rf.cc$OOB_R2_COR>0.25),]))]
+cca_cc_rsq25 = cca(abund_cc_rsq25 ~ ., data = envi_cc_ml)
+summary(cca_cc_rsq25) # 20.62% on two axis
+RsquareAdj(cca_cc_rsq25) # 63.36%
+# Select most informative environmental drivers
+set.seed(1994)
+#cca.step.both = ordistep(cca(abund_cc_rsq25~1,data=envi_cc_ml), scope=formula(cca_cc_rsq25), direction="both", pstep=1000)
+#formula(cca.step.both)
+cca.step.both = abund_cc_rsq25 ~ Biogeographical.province + Season.moment + Depth.bottom.max +
+   Fluorescence + Calcite.saturation.state + O_se + Latitude +
+   Depth.euph.zone + O_an + Sunshine.duration + Longitude +
+   Salinity + Lyapunov + DepthBathy + I_an + Gradient.Surface.temp.SST. +
+   Depth.max.Brunt.Väisälä + o_se + Ammonium.5m + Moon.phase.prop +
+   Ocean.region + upper_size_fraction
+
+res.cca=cca(formula=formula(cca.step.both), data=envi_cc_ml)
+summary(res.cca) # 20.03% on two axis
+RsquareAdj(res.cca) # 57.7%
+#anova.cca(res.cca, by = "axis") 
+ 
+
+# Triplot
+# Sites in background
+station <- scores(res.cca, scaling=2, choices = c(1:3))$sites
+station = as.data.frame(station)
+station = merge(station, envi_cc_ml, by = "row.names")
+rownames(station) = station[,1]
+station = station[,-1]
+station = station[,c(1,2,3,9)]
+station[,4] = sub(".*\\[(.*)\\].*", "\\1", station[,4], perl=TRUE)
+station = within(station,Biogeographical.province <- factor(Biogeographical.province,levels=c("ANTA","FKLD", "SATL","BENG","GUIA","CARB","NAST-E","NAST-W","GFST", 
+                                                                                            "MEDI","REDS", "ARAB","MONS","EAFR","ISSG", "CAMR","NPST","PNEC","PEOD","SPSG","CHIL")))
+# CC scores in the background as well
+ccscore <- scores(res.cca, scaling=2, choices = c(1:3))$species
+ccscore = as.data.frame(ccscore)
+
+g1 <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore$CCA1, y = ccscore$CCA2),size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(station[,1], station[,2], col = station[,4]), size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("#993366","#9966CC", "#66CCFF","#3399CC","#339999","#0066CC","#003399","#000099","#003366", 
+                                "#FFCC33","#FFFF33", "#99FF66","#33CC00","#339900","#336600","#CC6666", "#FF9966","#FF6633","#CC0000","#990000","#660000"))  +
+  labs(col = "Longhurst province") +
+  xlab("CCA1 (12.75%)") +  ylab("CCA2 (7.29%)")
+
+#scale_color_manual(values = c("#990000","#FF0000","#FFCC33","#FFFF00","#339900","#66CCFF","#003399","#FF00CC")) 
+
+# Adding envi variables 
+envi.scores <- scores(res.cca, choices = 1:3, display="bp", scaling=2)[-c(1:30,49,50),] # we get rid of biogeo provinces
+#row.names(envi.scores) = c("Irradiance seasonal anomaly", "Water residence time", "Temperature", "MLD", "Moon phase", "Lyapunov exponent", "NO2")
+row.names(envi.scores) = c("Max depth of sampling", "Fluorescence", "Calcite saturation state", "Oxygen saturation s.a.", "Lattitude", "Depth euphotic zone", "Oxygen saturation an.", "Sunshine duration", "Longitude",  "Salinity", "Lyapunov", "Bathymetry", "Density an.", "SST Gradient", "Depth Max Brunt Vaisala", "Dissolved oxygen s.a.", "Ammonium", "Moon phase")
+
+g12 <- g1 + geom_segment(data=as.data.frame(envi.scores),aes(xend = CCA1*3.8, yend = CCA2*3.8),x=0,y=0,size = 0.5, linetype="F1",color = 'steelblue4',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(envi.scores[,1]*4, envi.scores[,2]*4, label=rownames(envi.scores)), color="steelblue4")
+g12
+
+# And for the 3rd and fourth axis
+# Sites in background
+station <- scores(res.cca, scaling=2, choices = c(1:4))$sites
+station = as.data.frame(station)
+station = merge(station, envi_cc_ml, by = "row.names")
+rownames(station) = station[,1]
+station = station[,-1]
+station = station[,c(1,2,3,4,10)]
+station[,5] = sub(".*\\[(.*)\\].*", "\\1", station[,5], perl=TRUE)
+station = within(station,Biogeographical.province <- factor(Biogeographical.province,levels=c("ANTA","FKLD", "SATL","BENG","GUIA","CARB","NAST-E","NAST-W","GFST", 
+                                                                                            "MEDI","REDS", "ARAB","MONS","EAFR","ISSG", "CAMR","NPST","PNEC","PEOD","SPSG","CHIL")))
+# CC scores in the background as well
+ccscore <- scores(res.cca, scaling=2, choices = c(1:4))$species
+ccscore = as.data.frame(ccscore)
+
+g3 <- ggplot() +   geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x = ccscore$CCA3, y = ccscore$CCA4),size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(station[,3], station[,4], col = station[,5]), size = 3, alpha = 0.9) +
+  scale_color_manual(values = c("#993366","#9966CC", "#66CCFF","#3399CC","#339999","#0066CC","#003399","#000099","#003366", 
+                                "#FFCC33","#FFFF33", "#99FF66","#33CC00","#339900","#336600","#CC6666", "#FF9966","#FF6633","#CC0000","#990000","#660000"))  +
+  labs(col = "Longhurst province") +
+  xlab("CCA3 (6.80%)") +  ylab("CCA4 (5.82%)")
+
+#scale_color_manual(values = c("#990000","#FF0000","#FFCC33","#FFFF00","#339900","#66CCFF","#003399","#FF00CC")) 
+
+# Adding envi variables 
+envi.scores <- scores(res.cca, choices = 1:4, display="bp", scaling=2)[-c(1:30,49,50),] # we get rid of biogeo provinces
+#row.names(envi.scores) = c("Irradiance seasonal anomaly", "Water residence time", "Temperature", "MLD", "Moon phase", "Lyapunov exponent", "NO2")
+row.names(envi.scores) = c("Max depth of sampling", "Fluorescence", "Calcite saturation state", "Oxygen saturation s.a.", "Lattitude", "Depth euphotic zone", "Oxygen saturation s.a.", "Sunshine duration", "Longitude",  "Salinity", "Lyapunov", "Bathymetry", "Density", "SST Gradient", "Depth Max Brunt Vaisala", "Dissolved oxygen s.a.", "Ammonium", "Moon phase")
+
+g34 <- g3 + geom_segment(data=as.data.frame(envi.scores),aes(xend = CCA3*4, yend = CCA4*4),x=0,y=0,size = 0.5, linetype="F1",color = 'steelblue4',arrow = arrow(length = unit(0.2,"cm"))) +
+  geom_text(aes(envi.scores[,3]*4.2, envi.scores[,4]*4.2, label=rownames(envi.scores)), color="steelblue4")
+g34
+
+```
+
+
+```{r}
+##############    Exploration of functional annotations among PFCs with R2 > 0.25    #########
+
+cc_25_Kegg = CC2Kegg[which(CC2Kegg$CC_ID %in% names(abund_cc_rsq25)),]
+#write.table(cc_25_Kegg, "/home/faure/Documents/PhD/MAGs_Project/Data_tables/AnnotKOFAM/CC_rsq25_Kegg", row.names = F, quote = F)
+
+pathway2CC_rsq25 = pathway2CC[which(pathway2CC$CC_ID %in% names(abund_cc_rsq25)),]
+#length(unique(pathway2CC_rsq50$Pathway_Description)) #247
+
+# We build a table combining annotations and positions in CCA
+annot_explor = merge(ccscore, cc_25_Kegg, by.x = "row.names", by.y = "CC_ID", all = T)
+names(annot_explor)[1] = "CC_ID"
+annot_explor = merge(annot_explor, KeggToPathway, by.x = "KeggID", by.y = "Kegg_ID", all.x = T)
+annot_explor = annot_explor[order(annot_explor$CC_ID),]
+
+# Exploration of unknowns distribution on CCA axes
+annot_explor$is.annotated = is.na(annot_explor$Pathway_ID)
+a = ggplot() + geom_density(aes(CCA1, fill = is.annotated, col = is.annotated), alpha = 0.4, position = "stack", data = annot_explor) +
+  xlim(-3,2) + 
+  scale_color_discrete(labels = c("Unknown", "Known")) +
+  scale_fill_discrete(labels = c("Unknown", "Known")) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA1 (20.62%)", fill = "Kegg pathway\nannotation", col = "Kegg pathway\nannotation")
+a
+
+b = ggplot() + geom_density(aes(CCA2, fill = is.annotated, col = is.annotated), alpha = 0.4, position = "stack", data = annot_explor) +
+  xlim(-4,2) +
+  coord_flip() +
+  scale_color_discrete(labels = c("Unknown", "Known")) +
+  scale_fill_discrete(labels = c("Unknown", "Known")) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA2 (17.03%)", fill = "Kegg pathway\nannotation", col = "Kegg pathway\nannotation")
+b
+
+# Same for eggNOG unknowns:
+unkegg_expl = data.frame(CC_ID = row.names(ccscore), CCA1 = ccscore$CCA1, CCA2 = ccscore$CCA2)
+unkegg_expl$is.annotated = rep("Known", nrow(unkegg_expl))
+unkegg_expl$is.annotated[which(unkegg_expl$CC_ID %in% cc_stats[which(cc_stats$Unknowns.eggnog == 1),1])] = "Unknown"
+ggplot() + geom_density(aes(CCA1, fill = is.annotated, col = is.annotated), alpha = 0.4, position = "stack", data = unkegg_expl) +
+  xlim(-2,4) + 
+  scale_color_discrete(labels = c("Unknown", "Known")) +
+  scale_fill_discrete(labels = c("Unknown", "Known")) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA1 (20.62%)", fill = "EggNOG annotation", col = "EggNOG annotation")
+
+ggplot() + geom_density(aes(CCA2, fill = is.annotated, col = is.annotated), alpha = 0.4, position = "stack", data = unkegg_expl) +
+  xlim(-4,3) + 
+  scale_color_discrete(labels = c("Unknown", "Known")) +
+  scale_fill_discrete(labels = c("Unknown", "Known")) +
+  labs(y = "Density of connected components", x = "Coordinates along CCA2 (17.03%)", fill = "EggNOG annotation", col = "EggNOG annotation")
+
+
+#####   Centroids of KEGG pathways in the CCA space #####
+
+# To compute one centroid for all pathways
+path.list = unique(annot_explor$Pathway_Description)
+path.centroid = data.frame(Pathway = path.list, x.coord = rep(0, length(path.list)), y.coord = rep(0,length(path.list)), 
+                           x.min= rep(0,length(path.list)), x.max= rep(0,length(path.list)), y.min= rep(0,length(path.list)),
+                           y.max= rep(0,length(path.list)), x.plusSD = rep(0,length(path.list)), x.minusSD = rep(0,length(path.list)),
+                           y.plusSD = rep(0,length(path.list)), y.minusSD = rep(0,length(path.list)), n.path = rep(0,length(path.list)))
+
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.centroid[i,2] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,3] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,4] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,5] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,6] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,7] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,8] = path.centroid[i,2] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,9] = path.centroid[i,2] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,10] = path.centroid[i,3] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,11] = path.centroid[i,3] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,12] = nrow(annot_explor[which(annot_explor$Pathway_Description == focal.path),])
+}
+
+# Which pathways are the most interesting ones ?
+allpatgraph = ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(x=x.coord, y=y.coord, col=log(n.path)), alpha=0.6, data=path.centroid[which(path.centroid$n.path>10),], size = 3) +
+  geom_point(aes(x=mean(ccscore$CCA1), y = mean(ccscore$CCA2)), color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  labs(x="CCA1 (12.75%)", y = "CCA2 (7.29%)") +
+  scale_color_viridis_c()
+path.centroid[which(path.centroid[,2]<(-0.3)  & path.centroid$n.path>10),] # Staurosporine biosynthesis, Photosynthesis - antenna proteins, Linoleic acid metabolism, Renin-angiotensin system, MicroRNAs in cancer, Bacterial chemotaxis
+path.centroid[which(path.centroid[,3]<(-0.25) & path.centroid$n.path>10),] # Linoleic acid metabolism
+path.centroid[which(path.centroid[,3]>0.5 & path.centroid$n.path>10),] # Furfural degradation, Biosynthesis of type II polyketide products, Toluene degradation, Polycyclic aromatic hydrocarbon degradation
+
+# Specific pathways
+path.list=c("Staurosporine biosynthesis", "Photosynthesis - antenna proteins", "Linoleic acid metabolism", "Renin-angiotensin system, MicroRNAs in cancer", "Bacterial chemotaxis", "Furfural degradation", "Biosynthesis of type II polyketide products", "Toluene degradation", "Polycyclic aromatic hydrocarbon degradation")
+path.centroid = data.frame(Pathway = path.list, x.coord = rep(0, length(path.list)), y.coord = rep(0,length(path.list)), 
+                           x.min= rep(0,length(path.list)), x.max= rep(0,length(path.list)), y.min= rep(0,length(path.list)),
+                           y.max= rep(0,length(path.list)), x.plusSD = rep(0,length(path.list)), x.minusSD = rep(0,length(path.list)),
+                           y.plusSD = rep(0,length(path.list)), y.minusSD = rep(0,length(path.list)), n.path = rep(0,length(path.list)),
+                           stringsAsFactors = FALSE)
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.centroid[i,2] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,3] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,4] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,5] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,6] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,7] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,8] = path.centroid[i,2] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,9] = path.centroid[i,2] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),3])
+  path.centroid[i,10] = path.centroid[i,3] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,11] = path.centroid[i,3] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),4])
+  path.centroid[i,12] = nrow(annot_explor[which(annot_explor$Pathway_Description == focal.path),])
+}
+
+# Add Dark matter PFCs
+cc_stats_rf25 = cc_stats[which(cc_stats$CC_ID %in% cc_25_Kegg$CC_ID),]
+focal.darkmatt = as.character(unique(cc_stats_rf25[which(cc_stats_rf25$Unknowns.eggnog == 1 & cc_stats_rf25$Unknowns.kegg == 1 & cc_stats_rf25$Unknowns.taxo.Class == 1),]$CC_ID))
+linedark = nrow(path.centroid)+1
+path.centroid[linedark,] = rep(0, 12)
+path.centroid[linedark,2] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,3] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,4] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,5] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,6] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,7] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,8] = path.centroid[7,2] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,9] = path.centroid[7,2] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),3]))
+path.centroid[linedark,10] = path.centroid[7,3] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,11] = path.centroid[7,3] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),4]))
+path.centroid[linedark,12] = length(focal.darkmatt)
+path.centroid[linedark,1] = "Microbial dark matter"
+
+allpatgraph = allpatgraph + geom_point(aes(x= x.coord, y = y.coord), col = "black", size = 4, shape = 20, data = path.centroid[linedark,])
+allpatgraph
+
+```
+
+```{r}
+#####   Centroids of KEGG pathways in the 3rd and 4th axes of the CCA space #####
+
+# To compute one centroid for all pathways
+path.list = unique(annot_explor$Pathway_Description)
+path.centroid = data.frame(Pathway = path.list, x.coord = rep(0, length(path.list)), y.coord = rep(0,length(path.list)), 
+                           x.min= rep(0,length(path.list)), x.max= rep(0,length(path.list)), y.min= rep(0,length(path.list)),
+                           y.max= rep(0,length(path.list)), x.plusSD = rep(0,length(path.list)), x.minusSD = rep(0,length(path.list)),
+                           y.plusSD = rep(0,length(path.list)), y.minusSD = rep(0,length(path.list)), n.path = rep(0,length(path.list)))
+
+for (i in c(1:length(path.list))) {
+  focal.path = path.list[i]
+  path.centroid[i,2] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),5])
+  path.centroid[i,3] = mean(annot_explor[which(annot_explor$Pathway_Description == focal.path),6])
+  path.centroid[i,4] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),5])
+  path.centroid[i,5] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),5])
+  path.centroid[i,6] = min(annot_explor[which(annot_explor$Pathway_Description == focal.path),6])
+  path.centroid[i,7] = max(annot_explor[which(annot_explor$Pathway_Description == focal.path),6])
+  path.centroid[i,8] = path.centroid[i,2] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),5])
+  path.centroid[i,9] = path.centroid[i,2] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),5])
+  path.centroid[i,10] = path.centroid[i,3] + sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),6])
+  path.centroid[i,11] = path.centroid[i,3] - sd(annot_explor[which(annot_explor$Pathway_Description == focal.path),6])
+  path.centroid[i,12] = nrow(annot_explor[which(annot_explor$Pathway_Description == focal.path),])
+}
+
+# Which pathways are the most interesting ones ?
+allpatgraph = ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA3, y=CCA4), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_point(aes(x=x.coord, y=y.coord, col=log(n.path)), alpha=0.6, data=path.centroid[which(path.centroid$n.path>10),], size = 3) +
+  geom_point(aes(x=mean(ccscore$CCA3), y = mean(ccscore$CCA4)), color = "red", fill = "red", size = 5, alpha = 0.9, shape = 17) +
+  scale_color_viridis_c()
+path.centroid[which(path.centroid[,2]<(-0.3)  & path.centroid$n.path>10),] # Secondary bile acid biosynthesis
+path.centroid[which(path.centroid[,3]>(0.5) & path.centroid$n.path>10),] # Linoleic acid metabolism
+path.centroid[which(path.centroid[,2]>0.3 & path.centroid$n.path>10),] # Arabinogalactan biosynthesis - Mycobacterium
+
+# Add Dark matter PFCs
+cc_stats_rf25 = cc_stats[which(cc_stats$CC_ID %in% cc_25_Kegg$CC_ID),]
+focal.darkmatt = as.character(unique(cc_stats_rf25[which(cc_stats_rf25$Unknowns.eggnog == 1 & cc_stats_rf25$Unknowns.kegg == 1 & cc_stats_rf25$Unknowns.taxo.Class == 1),]$CC_ID))
+linedark = nrow(path.centroid)+1
+path.centroid[linedark,] = rep(0, 12)
+path.centroid[linedark,2] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),5]))
+path.centroid[linedark,3] = mean(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),6]))
+path.centroid[linedark,4] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),5]))
+path.centroid[linedark,5] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),5]))
+path.centroid[linedark,6] = min(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),6]))
+path.centroid[linedark,7] = max(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),6]))
+path.centroid[linedark,8] = path.centroid[7,2] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),5]))
+path.centroid[linedark,9] = path.centroid[7,2] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),5]))
+path.centroid[linedark,10] = path.centroid[7,3] + sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),6]))
+path.centroid[linedark,11] = path.centroid[7,3] - sd(unique(annot_explor[which(annot_explor$CC_ID %in% focal.darkmatt),6]))
+path.centroid[linedark,12] = length(focal.darkmatt)
+path.centroid[linedark,1] = "Microbial dark matter"
+
+allpatgraph = allpatgraph + geom_point(aes(x= x.coord, y = y.coord), col = "black", size = 4, shape = 20, data = path.centroid[linedark,])
+allpatgraph
+```
+
+```{r}
+##########    Exploration of the taxonomy of PFCs with R2 > 0.25 in the CCA space       #########
+
+CC_2_Mag_Rsq25 = CC_2_Mag[which(CC_2_Mag$CC_ID %in% names(abund_cc_rsq25)),] 
+
+taxo_explor = merge(ccscore, CC_2_Mag_Rsq25, by.x = "row.names", by.y = "CC_ID", all.y = T)
+#head(taxo_explor)
+
+#######   Barycenter of phylums  #####
+# First we need to create a taxo_explor table perfectly analogous to annot_explor
+taxo_explor = merge(taxo_explor, mags_taxo, by.x = "Mag_ID", by.y = "MAG")
+names(taxo_explor)[2] = "CC_ID"
+
+taxo.list=c("Cyanobacteria", "Acidobacteria", "Chloroflexi" , "Candidatus_Marinimicrobia ", "Ignavibacteriae")
+# taxo.list = unique(taxo_explor$Phylum)
+# taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Phylum == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid = within(taxo.centroid,Taxon <- factor(Taxon,levels=c("Cyanobacteria", "Acidobacteria","Chloroflexi" , "Candidatus_Marinimicrobia ", "Ignavibacteriae")))
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x="CCA1 (12.75%)",  y="CCA2 (7.29%)", size = "Number of associated PFCs", col = "Phylum barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(100,2000,4000))
+
+#######   Barycenter of classes  #####
+
+taxo.list=c("Bacilli","Dehalococcoidetes","Cytophagia", "Sphingobacteriia",
+            "Sphingobacteriia", "Epsilonproteobacteria", "Chroococcales")
+# taxo.list = unique(taxo_explor$Class)
+# taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Class == focal.taxon),]$CC_ID))
+}
+
+taxo.centroid = within(taxo.centroid,Taxon <- factor(Taxon,levels=c("Gammaproteobacteria","Flavobacteriia","Prochlorales", "Opitutae",
+                                                                    "Sphingobacteriia", "Spirochaetia", "Betaproteobacteria")))
+
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid, fontface = "bold", size = 4) +
+  labs(x="CCA1 (12.75%)",  y="CCA2 (7.29%)", size = "Number of associated PFCs", col = "Phylum barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(100,500,1000,2000))
+
+######### Now at the order level 
+
+taxo.list = unique(taxo_explor$Order)
+taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Order == focal.taxon),]$CC_ID))
+}
+
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),], fontface = "bold", size = 4) +
+  labs(x="CCA1 (12.75%)",  y="CCA2 (7.29%)", size = "Number of associated PFCs", col = "Order barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(10,100,1000))
+
+######### Now at the family level 
+
+taxo.list = unique(taxo_explor$Family)
+taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Family == focal.taxon),]$CC_ID))
+}
+
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),], fontface = "bold", size = 4) +
+  labs(x="CCA1 (12.75%)",  y="CCA2 (7.29%)", size = "Number of associated PFCs", col = "Family barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(10,100,1000))
+
+#### Now at the genus level
+taxo.list = unique(taxo_explor$Genus)
+taxo.list = taxo.list[!is.na(taxo.list)]
+
+taxo.centroid = data.frame(Taxon = taxo.list, x.coord = rep(0, length(taxo.list)), y.coord = rep(0,length(taxo.list)), 
+                           x.min= rep(0,length(taxo.list)), x.max= rep(0,length(taxo.list)), y.min= rep(0,length(taxo.list)),
+                           y.max= rep(0,length(taxo.list)), x.plusSD = rep(0,length(taxo.list)), x.minusSD = rep(0,length(taxo.list)),
+                           y.plusSD = rep(0,length(taxo.list)), y.minusSD = rep(0,length(taxo.list)), n.tax = rep(0,length(taxo.list)))
+
+# We add a "unique" to each line compared to the code exploring annot_explor
+# because here, each PFC can have multiple rows matching a Phylum
+for (i in c(1:length(taxo.list))) {
+  focal.taxon = taxo.list[i]
+  taxo.centroid[i,2] = mean(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,3] = mean(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,4] = min(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,5] = max(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,6] = min(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,7] = max(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,8] = taxo.centroid[i,2] + sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,9] = taxo.centroid[i,2] - sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),3]))
+  taxo.centroid[i,10] = taxo.centroid[i,3] + sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,11] = taxo.centroid[i,3] - sd(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),4]))
+  taxo.centroid[i,12] = length(unique(taxo_explor[which(taxo_explor$Genus == focal.taxon),]$CC_ID))
+}
+
+
+ggplot() + geom_hline(yintercept = 0, linetype='dotted') +
+  geom_vline(xintercept = 0, linetype='dotted') +
+  theme(plot.title=element_text(hjust=0.5)) +
+  geom_point(aes(x=CCA1, y=CCA2), data = ccscore, size = 0.5, alpha = 0.4, col = "grey") +
+  geom_errorbarh(aes(xmin = x.minusSD, xmax = x.plusSD, y = y.coord, col = Taxon), height = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_errorbar(aes(ymin = y.minusSD, ymax = y.plusSD, x = x.coord, col = Taxon), width = 0.1, data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_point(aes(x=x.coord, y=y.coord, col = Taxon, size = n.tax), data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),]) +
+  geom_text(aes(x=x.coord, y = y.coord, label = as.character(n.tax)), col = "white", data = taxo.centroid[which(taxo.centroid$x.coord<(-1)),], fontface = "bold", size = 4) +
+  labs(x="CCA1 (12.75%)",  y="CCA2 (7.29%)", size = "Number of associated PFCs", col = "Genus barycenter") +
+  scale_size_continuous(range = c(6,15), breaks = c(10,100,1000))
+
+
+# From which MAGs are all the PFTs from the left side coming ?
+
+#Mediterranean side of the CCA (CCA1<-1):
+nrow(taxo_explor[which(taxo_explor$CCA1<(-3)),]) #8364 Proteins
+length(unique(taxo_explor[which(taxo_explor$CCA1<(-3)),2])) #2836 CCs
+length(unique(substr(taxo_explor[which(taxo_explor$CCA1<(-3)),6],1,18))) #71 MAGs
+table(substr(taxo_explor[which(taxo_explor$CCA1<(-3)),6],1,18)) # >1000 prots involved (tot = 6293 / 8364, 75%) :ASW 00044 (pseudoalteromonas), MED 00139 (pseudoalteromonas), MED 00142 (pseudoalteromonas), PSE 00132 (pseudoalteromonas), PSE 00144 (pseudoalteromonas)
+table(taxo_explor[which(taxo_explor$CCA1<(-3)),12])
+taxo_explor_93 = taxo_explor[which(taxo_explor$CCA1<(-3)),]
+cc_stats_S93 = cc_stats[which(cc_stats$CC_ID %in% taxo_explor_93$CC_ID)]
+cc_stats_S93_Pseudoalteromonas = cc_stats[which(cc_stats$CC_ID %in% unique(taxo_explor_93[which(taxo_explor_93$Genus=="Pseudoalteromonas"),2])),]
+
+table(taxo_explor[which(taxo_explor$CCA1 <(-3)),8]) # No cyanobacteria, only bacteroidetes, planctomycetes and proteobacteria
+sum(table(taxo_explor[which(taxo_explor$CCA1 <(-1)),8])) # 727 cyanobacteria proteins over 24802 (2.93%)
+sum(table(taxo_explor[which(taxo_explor$CCA1 > (-1)),8])) # 1495 cyanobacteria proteins over 403976 (0.4%)
+
+mean(rf.cc$OOB_R2_COR)
+length(which(rank.rf.imp$Temperature<4))
+for(i in c(1:52)){
+mean(rf.cc[which(rank.rf.imp[,i]==1),1])
+}
+Stats_Pathways[which(Stats_Pathways$Freq.tot>1000),]
+darkmatt_cc_rf50=cc_stats_rf50[which(cc_stats_rf50$Unknowns.eggnog==1 & cc_stats_rf50$Unknowns.kegg==1 & cc_stats_rf50$Unknowns.taxo.Class==1),1]
+table(taxo_explor[which(taxo_explor$CC_ID %in% darkmatt_cc_rf50),1])
+sum(table(taxo_explor[which(taxo_explor$CC_ID %in% darkmatt_cc_rf50),1]))
+length(unique(taxo_explor[which(taxo_explor$CC_ID %in% darkmatt_cc_rf50),1]))
+table(taxo_explor[which(taxo_explor$CC_ID %in% darkmatt_cc_rf50),8])
+```
+
+
+
